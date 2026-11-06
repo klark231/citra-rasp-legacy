@@ -11,6 +11,8 @@
 #include "core/hle/service/nwm/uds_beacon.h"
 #include "core/hle/service/service.h"
 
+#include "core/hle/service/nwm/uds_common.h"
+
 namespace Service::NWM {
 
 enum class SAP : u8 { SNAPExtensionUsed = 0xAA };
@@ -89,9 +91,10 @@ constexpr u16 EAPoLStartMagic = 0x201;
 struct EAPoLStartPacket {
     u16_be magic = EAPoLStartMagic;
     u16_be association_id;
-    // This value is hardcoded to 1 in the NWM module.
-    u16_be unknown = 1;
-    INSERT_PADDING_BYTES(2);
+    // Azahar / MHGU crossplay put the ConnectionType in this low byte; stock Citra hardcoded 1 here.
+    // Same 4 bytes either way, so the node that follows keeps its offset. ParseCompatibleEAPoLStart reads both.
+    enum_le<ConnectionType> connection_type;
+    INSERT_PADDING_BYTES(3);
     EAPoLNodeInfo node;
 };
 
@@ -131,7 +134,16 @@ SecureDataHeader ParseSecureDataHeader(const std::vector<u8>& data);
  * communication.
  * @returns The generated frame body.
  */
-std::vector<u8> GenerateEAPoLStartFrame(u16 association_id, const NodeInfo& node_info);
+std::vector<u8> GenerateEAPoLStartFrame(u16 association_id, ConnectionType connection_type,
+                                        const NodeInfo& node_info);
+
+/// A tolerant parse of an EAPoL-Start accepting both stock Citra (unknown=1) and Azahar/hub (ConnectionType)
+/// encodings; `legacy` is set when the value had to be normalised.
+struct ParsedEAPoLStart {
+    EAPoLStartPacket packet;
+    bool legacy = false;
+};
+ParsedEAPoLStart ParseCompatibleEAPoLStart(const std::vector<u8>& frame);
 
 /*
  * Returns the EtherType of the specified 802.11 frame.

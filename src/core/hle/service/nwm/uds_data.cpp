@@ -288,9 +288,11 @@ SecureDataHeader ParseSecureDataHeader(const std::vector<u8>& data) {
     return header;
 }
 
-std::vector<u8> GenerateEAPoLStartFrame(u16 association_id, const NodeInfo& node_info) {
+std::vector<u8> GenerateEAPoLStartFrame(u16 association_id, ConnectionType connection_type,
+                                        const NodeInfo& node_info) {
     EAPoLStartPacket eapol_start{};
     eapol_start.association_id = association_id;
+    eapol_start.connection_type = connection_type;
     eapol_start.node.friend_code_seed = node_info.friend_code_seed;
 
     std::copy(node_info.username.begin(), node_info.username.end(),
@@ -378,6 +380,18 @@ EAPoLLogoffPacket ParseEAPoLLogoffFrame(const std::vector<u8>& frame) {
     // Skip the LLC header
     std::memcpy(&eapol_logoff, frame.data() + sizeof(LLCHeader), sizeof(eapol_logoff));
     return eapol_logoff;
+}
+
+ParsedEAPoLStart ParseCompatibleEAPoLStart(const std::vector<u8>& frame) {
+    ParsedEAPoLStart result{};
+    std::memcpy(&result.packet, frame.data() + sizeof(LLCHeader), sizeof(result.packet));
+    // Normalise the low byte: stock Citra sent unknown=1 (reads as 0 or 1 here), Azahar sends the
+    // ConnectionType directly. 0/1 -> Client, 2 -> Spectator, anything else -> Client.
+    const u8 raw = static_cast<u8>(result.packet.connection_type);
+    result.packet.connection_type =
+        raw == 2 ? ConnectionType::Spectator : ConnectionType::Client;
+    result.legacy = raw != 1 && raw != 2;
+    return result;
 }
 
 } // namespace Service::NWM

@@ -1,0 +1,64 @@
+# Win7-compatible release build of citra-rasp + MHGU crossplay.
+# Put this at .github/workflows/release-windows.yml on your fork.
+# Triggers: push a tag like v1.0.0-crossplay, or run it manually (Actions tab -> Run workflow).
+name: release-windows
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2019   # MSVC 2019 (v14.29): supports C++20 and still targets Windows 7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build deps (buildcache)
+        run: ./.ci/windows-msvc/deps.sh
+        shell: bash
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          toolset: 14.29
+
+      - name: Build (Release, bundled Qt5 + SDL2)
+        run: ./.ci/windows-msvc/build.sh
+        shell: bash
+        env:
+          ENABLE_COMPATIBILITY_REPORTING: "ON"
+
+      # Collect the exe(s) + every runtime DLL the build produced next to them.
+      # The bundled-Qt build drops Qt5 DLLs and plugins into build/bin already; if the first run
+      # shows a missing DLL at launch, add it here (check the Actions log 'list build/bin' step).
+      - name: Package
+        shell: bash
+        run: |
+          set -x
+          mkdir -p package
+          # find the built binaries wherever Ninja put them
+          find build -name 'citra-qt.exe' -o -name 'citra.exe' | while read f; do cp "$f" package/; done
+          BIN_DIR=$(dirname "$(find build -name 'citra-qt.exe' | head -1)")
+          echo "bin dir: $BIN_DIR"; ls -la "$BIN_DIR" || true
+          # bring everything beside the exe (Qt5 + SDL2 + plugins the bundled build staged)
+          cp -r "$BIN_DIR"/* package/ 2>/dev/null || true
+          ls -la package
+          powershell -Command "Compress-Archive -Path package/* -DestinationPath citra-rasp-crossplay-${{ github.ref_name }}-win7.zip -Force"
+
+      - name: Upload artifact (always, so you can grab it even without a tag)
+        uses: actions/upload-artifact@v4
+        with:
+          name: citra-rasp-crossplay-win7
+          path: package/
+
+      - name: Publish release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: citra-rasp-crossplay-*-win7.zip

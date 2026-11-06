@@ -353,11 +353,16 @@ add_library(core STATIC
     hle/service/nwm/nwm_tst.h
     hle/service/nwm/nwm_uds.cpp
     hle/service/nwm/nwm_uds.h
+    hle/service/nwm/mhgu_hub.cpp
+    hle/service/nwm/mhgu_hub.h
+    hle/service/nwm/mhgu_hub_proto.cpp
+    hle/service/nwm/mhgu_hub_proto.h
     hle/service/nwm/uds_beacon.cpp
     hle/service/nwm/uds_beacon.h
     hle/service/nwm/uds_connection.cpp
     hle/service/nwm/uds_connection.h
     hle/service/nwm/uds_data.cpp
+    hle/service/nwm/uds_common.h
     hle/service/nwm/uds_data.h
     hle/service/pm/pm.cpp
     hle/service/pm/pm.h

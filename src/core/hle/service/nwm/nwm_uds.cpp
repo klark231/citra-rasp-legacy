@@ -16,6 +16,7 @@
 #include "core/hle/lock.h"
 #include "core/hle/result.h"
 #include "core/hle/service/nwm/nwm_uds.h"
+#include "core/hle/service/nwm/mhgu_hub.h"
 #include "core/hle/service/nwm/uds_beacon.h"
 #include "core/hle/service/nwm/uds_connection.h"
 #include "core/hle/service/nwm/uds_data.h"
@@ -60,6 +61,11 @@ std::list<Network::WifiPacket> NWM_UDS::GetReceivedBeacons(const MacAddress& sen
 
 /// Sends a WifiPacket to the room we're currently connected to.
 void SendPacket(Network::WifiPacket& packet) {
+    // MHGU hub crossplay: with the hub on, local play goes to the hub instead of a room.
+    if (MhguBridge::Enabled()) {
+        MhguBridge::Send(packet);
+        return;
+    }
     if (auto room_member = Network::GetRoomMember().lock()) {
         if (room_member->GetState() == Network::RoomMember::State::Joined ||
             room_member->GetState() == Network::RoomMember::State::Moderator) {
@@ -166,7 +172,7 @@ void NWM_UDS::HandleAssociationResponseFrame(const Network::WifiPacket& packet) 
     using Network::WifiPacket;
     WifiPacket eapol_start;
     eapol_start.channel = network_channel;
-    eapol_start.data = GenerateEAPoLStartFrame(std::get<u16>(assoc_result), current_node);
+    eapol_start.data = GenerateEAPoLStartFrame(std::get<u16>(assoc_result), conn_type, current_node);
     // TODO(B3N30): Encrypt the packet.
     eapol_start.destination_address = packet.transmitter_address;
     eapol_start.type = WifiPacket::PacketType::Data;
@@ -571,6 +577,11 @@ void NWM_UDS::RecvBeaconBroadcastData(Kernel::HLERequestContext& ctx) {
 
     std::size_t cur_buffer_size = sizeof(BeaconDataReplyHeader);
 
+    // MHGU hub crossplay: the hubs on the hub servers arrive as beacons.
+    if (MhguBridge::Enabled()) {
+        MhguBridge::Scan(wlan_comm_id, static_cast<u8>(id));
+    }
+
     // Retrieve all beacon frames that were received from the desired mac address.
     auto beacons = GetReceivedBeacons(mac_address);
 
@@ -925,6 +936,9 @@ void NWM_UDS::UpdateNetworkAttribute(Kernel::HLERequestContext& ctx) {
 void NWM_UDS::DestroyNetwork(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx, 0x08, 0, 0);
 
+    // MHGU hub: the hosted room closes.
+    MhguBridge::HostStop();
+
     // Unschedule the beacon broadcast event.
     system.CoreTiming().UnscheduleEvent(beacon_broadcast_event, 0);
 
@@ -961,6 +975,9 @@ void NWM_UDS::DestroyNetwork(Kernel::HLERequestContext& ctx) {
 
 void NWM_UDS::DisconnectNetwork(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx, 0xA, 0, 0);
+
+    // MHGU hub: leave the joined room.
+    MhguBridge::ClientLeave();
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
 
     using Network::WifiPacket;
@@ -1165,6 +1182,7 @@ void NWM_UDS::ConnectToNetwork(Kernel::HLERequestContext& ctx, u16 command_id,
                                u8 connection_type, std::vector<u8> passphrase) {
     network_info = {};
     std::memcpy(&network_info, network_info_buffer, network_info_size);
+    conn_type = static_cast<ConnectionType>(connection_type);
 
     // Start the connection sequence
     StartConnectionSequence(network_info.host_mac_address);
@@ -1330,6 +1348,11 @@ void NWM_UDS::BeaconBroadcastCallback(u64 userdata, s64 cycles_late) {
     packet.channel = network_channel;
 
     SendPacket(packet);
+
+    // MHGU hub crossplay: publish the hosted network's state for its listing on the hub servers.
+    if (MhguBridge::Enabled()) {
+        MhguBridge::HostUpdate(network_info, node_info);
+    }
 
     // Start broadcasting the network, send a beacon frame every 102.4ms.
     system.CoreTiming().ScheduleEvent(msToCycles(DefaultBeaconInterval * MillisecondsPerTU) -

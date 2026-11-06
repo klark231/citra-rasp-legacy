@@ -126,6 +126,13 @@ struct TouchFromButtonMap {
 };
 
 struct Values {
+    // MHGU crossplay hub (ported from AzaharPlus)
+    bool mhgu_hub_enabled = false;
+    std::string mhgu_hub_servers = "hunterhubid-gu-hub.duckdns.org morerokk-mhgurecomp-ldnserver.duckdns.org";
+    std::string mhgu_hub_key = "";
+    bool mhgu_hub_convert = true;
+    bool mhgu_hub_log = false;
+
     // CheckNew3DS
     bool is_new_3ds;
 

@@ -19,6 +19,7 @@
 #include "common/swap.h"
 #include "core/hle/service/service.h"
 #include "network/network.h"
+#include "core/hle/service/nwm/uds_common.h"
 
 namespace Core {
 class System;
@@ -516,6 +517,9 @@ private:
 
     // Information about the network that we're currently connected to.
     NetworkInfo network_info;
+    // How this console joined (set from ConnectToNetwork); sent in the EAPoL-Start so an
+    // Azahar / MHGU-hub host accepts us instead of reading a 0 in the connection-type byte.
+    ConnectionType conn_type{ConnectionType::Client};
 
     // Mapping of mac addresses to their respective node_ids.
     struct Node {
