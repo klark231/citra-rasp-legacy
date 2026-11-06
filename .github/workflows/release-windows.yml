@@ -12,26 +12,215 @@ permissions:
 
 jobs:
   windows:
-    runs-on: windows-2019   # MSVC 2019 (v14.29): supports C++20 and still targets Windows 7
+    runs-on: windows-2022   # windows-2019 image was retired; we install the v142 (14.29) toolset below, which still targets Windows 7
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false   # fetched below, with mirror fallbacks for the deleted citra-emu repos
 
-      - name: Install build deps (buildcache)
-        run: ./.ci/windows-msvc/deps.sh
+      - name: Fetch submodules (with mirror fallbacks)
         shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          # Pull one submodule at its pinned commit, trying each mirror until one has it.
+          fetch_sub() {
+            path="$1"; shift
+            sha=$(git ls-tree HEAD "$path" | awk '{print $3}')
+            echo "== $path @ $sha"
+            rm -rf "$path"; mkdir -p "$path"; git -C "$path" init -q
+            for url in "$@"; do
+              if git -C "$path" fetch -q --depth=1 "$url" "$sha" 2>/dev/null; then
+                git -C "$path" checkout -q FETCH_HEAD && echo "OK: $path <- $url" && return 0
+              fi
+              echo "   no luck: $url"
+            done
+            echo "::error::No mirror has commit $sha for $path"; return 1
+          }
+          fetch_sub externals/dynarmic \
+            https://github.com/lioncash/dynarmic.git \
+            https://github.com/Vita3K/dynarmic.git \
+            https://github.com/yuzu-emu/dynarmic.git \
+            https://github.com/Lime3DS/dynarmic.git \
+            https://github.com/PabloMK7/dynarmic.git \
+            https://github.com/azahar-emu/dynarmic.git
+          fetch_sub externals/libressl \
+            https://github.com/azahar-emu/ext-libressl-portable.git \
+            https://github.com/Lime3DS/ext-libressl-portable.git \
+            https://github.com/PabloMK7/ext-libressl-portable.git
+          fetch_sub externals/soundtouch \
+            https://github.com/azahar-emu/soundtouch.git \
+            https://github.com/azahar-emu/ext-soundtouch.git \
+            https://github.com/Lime3DS/ext-soundtouch.git \
+            https://github.com/PabloMK7/ext-soundtouch.git \
+          || {
+            # The pinned commit lived only in the deleted citra-emu/ext-soundtouch repo.
+            # Fall back to the current branch of a maintained SoundTouch (same API, same CMake target).
+            echo "::warning::pinned soundtouch commit not found, using a newer SoundTouch"
+            rm -rf externals/soundtouch
+            git clone -q --depth=1 https://github.com/azahar-emu/soundtouch.git externals/soundtouch \
+              || git clone -q --depth=1 https://codeberg.org/soundtouch/soundtouch.git externals/soundtouch
+          }
+          # everything else: normal submodule checkout
+          others=$(git ls-files -s | awk '$1==160000{print $4}' | grep -v -E '^externals/(dynarmic|libressl|soundtouch)$')
+          git submodule sync
+          git submodule update --init --force --depth=1 --recursive -- $others
+
+      - name: Patch externals for newer SoundTouch
+        shell: bash
+        run: |
+          sed -i 's#target_include_directories(SoundTouch INTERFACE ./soundtouch/include)#target_include_directories(SoundTouch INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/soundtouch/include>)#' externals/CMakeLists.txt
+          grep -n "SoundTouch" externals/CMakeLists.txt
+
+      - name: Patch cpp-jwt json for C++20 (allocator::construct/destroy were removed)
+        shell: bash
+        run: |
+          f=externals/cpp-jwt/include/jwt/json/json.hpp
+          sed -i -E 's/\balloc\.destroy\(/std::allocator_traits<decltype(alloc)>::destroy(alloc, /g; s/\balloc\.construct\(/std::allocator_traits<decltype(alloc)>::construct(alloc, /g' "$f"
+          grep -n "allocator_traits<decltype(alloc)>" "$f" | head
+
+      # fmt 6 does not compile in C++20 mode on MSVC 19.29; fmt 7.1.3 does and Citra only uses basic APIs.
+      - name: Upgrade fmt to 7.1.3
+        shell: bash
+        run: |
+          rm -rf externals/fmt
+          git clone -q --depth=1 --branch 7.1.3 https://github.com/fmtlib/fmt.git externals/fmt
+          # fmt 7 already defines the fmt::fmt alias itself
+          sed -i '/add_library(fmt::fmt ALIAS fmt)/d' externals/CMakeLists.txt
+          grep -n "fmt" externals/CMakeLists.txt
+
+      # Newer SoundTouch uses float samples; Citra feeds it s16. Convert when needed.
+      - name: Patch time_stretch.cpp for float/int SoundTouch
+        shell: bash
+        run: |
+          python - <<'PY'
+          f = 'src/audio_core/time_stretch.cpp'
+          t = open(f, encoding='utf-8').read()
+          t = t.replace('#include <memory>\n', '#include <memory>\n#include <type_traits>\n#include <vector>\n', 1)
+          old = '\n'.join([
+              '    sound_touch->putSamples(in, static_cast<u32>(num_in));',
+              '    return sound_touch->receiveSamples(out, static_cast<u32>(num_out));',
+              ''])
+          # One code path that compiles for BOTH sample types (if constexpr would still
+          # compile the unused branch here, because this function is not a template).
+          new = '\n'.join([
+              '    constexpr double scale =',
+              '        std::is_floating_point_v<soundtouch::SAMPLETYPE> ? 1.0 / 32768.0 : 1.0;',
+              '    std::vector<soundtouch::SAMPLETYPE> in_st(num_in * 2);',
+              '    for (std::size_t i = 0; i < in_st.size(); i++) {',
+              '        in_st[i] = static_cast<soundtouch::SAMPLETYPE>(static_cast<double>(in[i]) * scale);',
+              '    }',
+              '    sound_touch->putSamples(in_st.data(), static_cast<u32>(num_in));',
+              '    std::vector<soundtouch::SAMPLETYPE> out_st(num_out * 2);',
+              '    const std::size_t got =',
+              '        sound_touch->receiveSamples(out_st.data(), static_cast<u32>(num_out));',
+              '    for (std::size_t i = 0; i < got * 2; i++) {',
+              '        const double v = static_cast<double>(out_st[i]) / scale;',
+              '        out[i] = static_cast<s16>(std::min(32767.0, std::max(-32768.0, v)));',
+              '    }',
+              '    return got;',
+              ''])
+          assert old in t, 'time_stretch.cpp layout changed'
+          open(f, 'w', encoding='utf-8').write(t.replace(old, new, 1))
+          print('patched time_stretch.cpp')
+          PY
+
+      # Chocolatey timed out last time. ninja is preinstalled and curl replaces wget;
+      # buildcache is only a speed-up, so a failed download must not stop the build.
+      # C++20 makes u8"..." literals char8_t, which Qt's tr() rejects (only 2 such literals exist).
+      - name: Patch u8 literals for Qt tr()
+        shell: bash
+        run: |
+          sed -i -E 's/tr\((u8"[^"]*")\)/tr(reinterpret_cast<const char*>(\1))/' src/citra_qt/game_list.cpp
+          grep -n 'u8"' src/citra_qt/game_list.cpp
+
+      - name: Install buildcache (optional)
+        shell: bash
+        continue-on-error: true
+        run: |
+          curl -fL --retry 3 -o buildcache.zip https://github.com/mbitsnbites/buildcache/releases/download/v0.22.3/buildcache-win-mingw.zip
+          7z x -y buildcache.zip
+          mkdir -p /c/ProgramData/chocolatey/bin
+          mv ./buildcache/bin/buildcache.exe /c/ProgramData/chocolatey/bin/
+          rm -rf ./buildcache buildcache.zip
+          ninja --version
+
+      - name: Install MSVC v142 (14.29) toolset
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Start-Process -Wait -FilePath "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe" -ArgumentList "modify --installPath `"$vs`" --add Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64 --quiet --norestart --nocache"
+          Get-ChildItem "$vs\VC\Tools\MSVC"
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           toolset: 14.29
 
-      - name: Build (Release, bundled Qt5 + SDL2)
-        run: ./.ci/windows-msvc/build.sh
+      # citra-emu/ext-windows-bin (bundled Qt 5.10 / SDL2 / FFmpeg) was deleted, so get them elsewhere.
+      # Qt 5.15 is the last Qt line that still supports Windows 7.
+      - name: Install Qt 5.15.2 (msvc2019_64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '5.15.2'
+          host: windows
+          target: desktop
+          arch: win64_msvc2019_64
+          cache: true
+
+      - name: Get SDL2 (drop into the folder CMake expects)
         shell: bash
-        env:
-          ENABLE_COMPATIBILITY_REPORTING: "ON"
+        run: |
+          mkdir -p build/externals
+          curl -fL -o sdl2.zip https://github.com/libsdl-org/SDL/releases/download/release-2.28.5/SDL2-devel-2.28.5-VC.zip
+          7z x sdl2.zip -obuild/externals/_sdl
+          mv build/externals/_sdl/SDL2-2.28.5 build/externals/SDL2-2.0.8
+          ls build/externals/SDL2-2.0.8/lib/x64
+
+      - name: Build (Release)
+        shell: bash
+        run: |
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../CMakeModules/MSVCCache.cmake" -DUSE_CCACHE=ON \
+            -DCITRA_USE_BUNDLED_QT=OFF -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
+            -DCITRA_USE_BUNDLED_SDL2=ON \
+            -DCITRA_ENABLE_COMPATIBILITY_REPORTING=ON -DENABLE_COMPATIBILITY_LIST_DOWNLOAD=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF -DENABLE_MF=ON \
+            -DENABLE_FFMPEG_VIDEO_DUMPER=OFF -DENABLE_FFMPEG_AUDIO_DECODER=OFF
+          set +e
+          ninja -k 0 citra-qt citra 2>&1 | tee ninja.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" != "0" ]; then
+            echo "=================== ERROR SUMMARY (only the failures) ==================="
+            grep -E "error C[0-9]+|error LNK[0-9]+|fatal error|FAILED:" ninja.log | sort -u | head -100
+            { echo '## Build errors'; echo '```'; grep -E "error C[0-9]+|error LNK[0-9]+|fatal error|FAILED:" ninja.log | sort -u | head -100; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            echo "---- context around first template/instantiation errors ----"
+            grep -E "see reference to|while compiling|error C" ninja.log | grep -E "src.(core|audio_core)|error C" | sort -u | head -60
+            exit $rc
+          fi
+          buildcache -s || true
+          BIN_DIR=$(dirname "$(find . -name 'citra-qt.exe' | head -1)")
+          "$QT_ROOT_DIR/bin/windeployqt.exe" --release --no-translations "$BIN_DIR/citra-qt.exe"
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ninja-log
+          path: build/ninja.log
+          if-no-files-found: ignore
+
+      # Win7 without KB2999226 / redistributable: ship the CRT beside the exe (app-local deployment)
+      - name: Bundle app-local UCRT + VC runtime
+        shell: bash
+        run: |
+          BIN_DIR=$(dirname "$(find build -name 'citra-qt.exe' | head -1)")
+          cp "/c/Program Files (x86)/Windows Kits/10/Redist/ucrt/DLLs/x64/"*.dll "$BIN_DIR"/
+          VCR=$(find "/c/Program Files/Microsoft Visual Studio/2022" -path "*Redist/MSVC/14.29*/x64/Microsoft.VC142.CRT" -type d | head -1)
+          [ -z "$VCR" ] && VCR=$(find "/c/Program Files/Microsoft Visual Studio/2022" -path "*Redist/MSVC/*/x64/Microsoft.VC14*.CRT" -type d | head -1)
+          echo "VC CRT: $VCR"; cp "$VCR"/*.dll "$BIN_DIR"/
 
       # Collect the exe(s) + every runtime DLL the build produced next to them.
       # The bundled-Qt build drops Qt5 DLLs and plugins into build/bin already; if the first run
